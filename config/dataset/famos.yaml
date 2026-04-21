@@ -3,14 +3,15 @@ defaults:
   - view_sampler: bounded
 
 name: famos
-data_root: datasets/famos
+data_root: /media/nguyen/FaMoS
 
-load_stereo: true
+load_stereo: false
 load_color: true
 image_resize_factor: 1.0
+subset_fraction: 1.0  # fraction of the split to load, e.g. 0.1 for 10%
 
 input_image_shape: [256, 256]
-original_image_shape: [1024, 1280]
+original_image_shape: [1200, 1600]
 cameras_are_circular: false
 
 baseline_min: 1e-3

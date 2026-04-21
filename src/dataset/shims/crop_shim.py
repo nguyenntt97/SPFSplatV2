@@ -14,11 +14,20 @@ def rescale(
 ) -> Float[Tensor, "3 h_out w_out"]:
     h, w = shape
     image_new = (image * 255).clip(min=0, max=255).type(torch.uint8)
-    image_new = rearrange(image_new, "c h w -> h w c").detach().cpu().numpy()
+    
+    if image_new.shape[0] == 1:
+        image_new = rearrange(image_new, "1 h w -> h w").detach().cpu().numpy()
+    else:
+        image_new = rearrange(image_new, "c h w -> h w c").detach().cpu().numpy()
+
     image_new = Image.fromarray(image_new)
     image_new = image_new.resize((w, h), Image.LANCZOS)
     image_new = np.array(image_new) / 255
     image_new = torch.tensor(image_new, dtype=image.dtype, device=image.device)
+    
+    if len(image_new.shape) == 2:
+        image_new = rearrange(image_new, "h w -> h w 1")
+    
     return rearrange(image_new, "h w c -> c h w")
 
 
@@ -26,6 +35,7 @@ def center_crop(
     images: Float[Tensor, "*#batch c h w"],
     intrinsics: Float[Tensor, "*#batch 3 3"],
     shape: tuple[int, int],
+    **kwargs
 ) -> tuple[
     Float[Tensor, "*#batch c h_out w_out"],  # updated images
     Float[Tensor, "*#batch 3 3"],  # updated intrinsics
@@ -40,18 +50,24 @@ def center_crop(
     # Center-crop the image.
     images = images[..., :, row : row + h_out, col : col + w_out]
 
+    matting = kwargs.pop("matting", None)
+    if matting is not None:
+        matting = matting[..., :, row : row + h_out, col : col + w_out]
+        kwargs["matting"] = matting
+
     # Adjust the intrinsics to account for the cropping.
     intrinsics = intrinsics.clone()
     intrinsics[..., 0, 0] *= w_in / w_out  # fx
     intrinsics[..., 1, 1] *= h_in / h_out  # fy
 
-    return images, intrinsics
+    return images, intrinsics, kwargs
 
 
 def rescale_and_crop(
     images: Float[Tensor, "*#batch c h w"],
     intrinsics: Float[Tensor, "*#batch 3 3"],
     shape: tuple[int, int],
+    **kwargs
 ) -> tuple[
     Float[Tensor, "*#batch c h_out w_out"],  # updated images
     Float[Tensor, "*#batch 3 3"],  # updated intrinsics
@@ -70,17 +86,27 @@ def rescale_and_crop(
     *batch, c, h, w = images.shape
     images = images.reshape(-1, c, h, w)
     images = torch.stack([rescale(image, (h_scaled, w_scaled)) for image in images])
+
+    mattings = kwargs.pop("matting", None)
+    if mattings is not None:
+        mattings = mattings.reshape(-1, 1, h, w)
+        mattings = torch.stack([rescale(matting, (h_scaled, w_scaled)) for matting in mattings])
+        mattings = mattings.reshape(*batch, 1, h_scaled, w_scaled)
+        kwargs["matting"] = mattings
+
     images = images.reshape(*batch, c, h_scaled, w_scaled)
 
-    return center_crop(images, intrinsics, shape)
+    return center_crop(images, intrinsics, shape, **kwargs)
 
 
 def apply_crop_shim_to_views(views: AnyViews, shape: tuple[int, int]) -> AnyViews:
-    images, intrinsics = rescale_and_crop(views["image"], views["intrinsics"], shape)
+    images, intrinsics, kwargs = rescale_and_crop(views["image"], views["intrinsics"], shape, \
+        matting=views.get("matting", None))
     return {
         **views,
         "image": images,
         "intrinsics": intrinsics,
+        **kwargs
     }
 
 

@@ -164,7 +164,7 @@ def train(cfg_dict: DictConfig):
     # Load the encoder weights.
     if cfg.model.encoder.pretrained_weights and cfg.mode == "train":
         weight_path = cfg.model.encoder.pretrained_weights
-        ckpt_weights = torch.load(weight_path, map_location='cpu')
+        ckpt_weights = torch.load(weight_path, map_location='cpu', weights_only=False)
         if 'model' in ckpt_weights:
             ckpt_weights = ckpt_weights['model']
             ckpt_weights = checkpoint_filter_fn(ckpt_weights, encoder)

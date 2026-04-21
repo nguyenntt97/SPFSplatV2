@@ -38,11 +38,12 @@ class DatasetFaMoSCfg(DatasetCfgCommon):
     augment: bool
     relative_pose: bool
     skip_bad_shape: bool
-    load_stereo: bool = True
+    load_stereo: bool = False
     load_color: bool = True
     image_resize_factor: float = 1.0
     near: float = -1.0
     far: float = -1.0
+    subset_fraction: float = 1.0  # fraction of the split to load (0.0, 1.0]
 
 
 @dataclass
@@ -92,10 +93,18 @@ class DatasetFaMOS(Dataset):
         self.split_root = split_root
         self.split_list = self._load_json(data_list_fname)
 
+        # Optionally sub-sample the split list
+        if cfg.subset_fraction < 1.0:
+            n = max(1, int(len(self.split_list) * cfg.subset_fraction))
+            self.split_list = self.split_list[:n]
+            print(f"[DatasetFaMOS] Using {n}/{len(self._load_json(data_list_fname))} "
+                  f"samples ({cfg.subset_fraction*100:.1f}%) for stage={stage}")
+
         # Set up directory accessors
         self.dataset_root_dir = Path(data_list_fname).parent
         self.calibration_dir_base = split_root / "calibrations"
         self.image_dir = split_root / "downsampled_images_4"
+        self.matting_dir = split_root / "matting"
 
         if not self.calibration_dir_base.exists():
             raise RuntimeError(f"Calibration directory not found: {self.calibration_dir_base}")
@@ -144,6 +153,10 @@ class DatasetFaMOS(Dataset):
         img_dir = self._img_dir(subject, sequence, frame)
         return os.path.join(img_dir, f"{sequence}.{frame}.{view}.png")
 
+    def _matting_fname(self, subject: str, sequence: str, frame: str, view: str) -> str:
+        matting_dir = self.matting_dir / subject / sequence / frame
+        return os.path.join(matting_dir, f"{sequence}.{frame}.{view}.png")
+
     def _calibration_dir(self, subject: str, sequence: str) -> str:
         return str(self.calibration_dir_base / subject / sequence)
 
@@ -161,6 +174,7 @@ class DatasetFaMOS(Dataset):
     ):
         view_name = get_filename(calib_fname)
         image_fname = self._img_fname(subject, sequence, frame, view_name)
+        matting_fname = self._matting_fname(subject, sequence, frame, view_name)
 
         if not os.path.exists(image_fname):
             return None
@@ -184,10 +198,21 @@ class DatasetFaMOS(Dataset):
                 (camera["image_size"][1], camera["image_size"][0]),
                 interpolation=cv2.INTER_AREA,
             )
+        
+        # load matting
+        if os.path.exists(matting_fname):
+            matting = imageio.imread(matting_fname, pilmode="L")
+            matting = cv2.resize(
+                matting,
+                (camera["image_size"][1], camera["image_size"][0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
 
         # Rotate portrait images to landscape
         if camera["image_size"][0] > camera["image_size"][1]:
             image, camera = rotate_image(image, camera)
+            if os.path.exists(matting_fname):
+                matting, camera = rotate_image(matting, camera)
 
         # Convert to torch tensors
         image = (
@@ -195,7 +220,14 @@ class DatasetFaMOS(Dataset):
             .permute(2, 0, 1)
             .contiguous()
         )  # (3, H, W) in 0-255 range
+        matting = (
+            torch.from_numpy(matting.astype(np.float32))
+            .unsqueeze(0)
+            .contiguous()
+        )  # (1, H, W) in 0-255 range
+        
         intrinsics = torch.from_numpy(camera["intrinsics"].astype(np.float32))
+        
         # Build 4×4 extrinsics (w2c)
         ext_3x4 = camera["extrinsics"].astype(np.float32)  # (3, 4) w2c
         ext_4x4 = np.eye(4, dtype=np.float32)
@@ -204,6 +236,7 @@ class DatasetFaMOS(Dataset):
 
         return {
             "image": image,
+            "matting": matting,
             "intrinsics": intrinsics,
             "extrinsics": extrinsics,
             "image_size": camera["image_size"],
@@ -224,6 +257,7 @@ class DatasetFaMOS(Dataset):
         calib_fnames = sorted(glob.glob(os.path.join(calib_dir, "*.tka")))
 
         all_images = []
+        all_mattings = []
         all_intrinsics = []
         all_extrinsics = []
         image_size = None
@@ -246,6 +280,8 @@ class DatasetFaMOS(Dataset):
                 continue
 
             all_images.append(result["image"])
+            # matting
+            all_mattings.append(result["matting"])
             all_intrinsics.append(result["intrinsics"])
             all_extrinsics.append(result["extrinsics"])
             if image_size is None:
@@ -258,6 +294,13 @@ class DatasetFaMOS(Dataset):
         # Stack into tensors
         images = torch.stack(all_images)  # (V, 3, H, W) in 0-255
         images = images / 255.0  # normalise to 0-1
+        mattings = torch.stack(all_mattings)  # (V, H, W)
+        mattings = mattings / 255.0  # normalise to 0-1
+
+        # binary matting
+        mattings = (mattings > 0.5).float()
+        images = images * mattings
+
         intrinsics_raw = torch.stack(all_intrinsics)  # (V, 3, 3) pixel-space
         extrinsics_w2c = torch.stack(all_extrinsics)  # (V, 4, 4) world-to-camera
 
@@ -302,12 +345,27 @@ class DatasetFaMOS(Dataset):
             3,
             *self.cfg.original_image_shape,
         )
-        if self.cfg.skip_bad_shape and (context_image_invalid or target_image_invalid):
-            print(
-                f"Skipped bad example {scene}. Context shape was "
-                f"{context_images.shape} and target shape was "
-                f"{target_images.shape}."
-            )
+        context_matting_invalid = mattings[context_indices].shape[1:] != (1,
+            *self.cfg.original_image_shape,
+        )
+        target_matting_invalid = mattings[target_indices].shape[1:] != (
+            1,  
+            *self.cfg.original_image_shape,
+        )
+
+        if self.cfg.skip_bad_shape and (context_image_invalid or target_image_invalid or context_matting_invalid or target_matting_invalid):
+            if context_image_invalid or target_image_invalid:
+                print(
+                    f"Skipped bad example {scene}. Context shape was "
+                    f"{context_images.shape} and target shape was "
+                    f"{target_images.shape}."
+                )
+            elif context_matting_invalid or target_matting_invalid:
+                print(
+                    f"Skipped bad example {scene}. Context matting shape was "
+                    f"{mattings[context_indices].shape} and target matting shape was "
+                    f"{mattings[target_indices].shape}."
+                )
             return self.__getitem__((index + 1) % len(self))
 
         # --- Baseline normalisation ---
@@ -337,6 +395,7 @@ class DatasetFaMOS(Dataset):
                 "far": self.get_bound("far", len(context_indices)) / scale,
                 "index": context_indices,
                 "overlap": overlap,
+                # "matting": mattings[context_indices],
             },
             "target": {
                 "extrinsics": extrinsics[target_indices],
@@ -344,7 +403,8 @@ class DatasetFaMOS(Dataset):
                 "image": target_images,
                 "near": self.get_bound("near", len(target_indices)) / scale,
                 "far": self.get_bound("far", len(target_indices)) / scale,
-                "index": target_indices,
+                "index": target_indices,    
+                "matting": mattings[target_indices],
             },
             "scene": scene,
         }
